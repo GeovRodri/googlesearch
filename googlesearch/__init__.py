@@ -53,12 +53,13 @@ import random
 import sys
 import time
 import math
-import requests
 
 if sys.version_info[0] > 2:
+    from urllib.request import Request, urlopen
     from urllib.parse import quote_plus, urlparse, parse_qs
 else:
     from urllib import quote_plus
+    from urllib2 import Request, urlopen
     from urlparse import urlparse, parse_qs
 
 try:
@@ -67,8 +68,6 @@ try:
 except ImportError:
     from BeautifulSoup import BeautifulSoup
     is_bs4 = False
-
-cookie = None
 
 # URL templates to make Google searches.
 url_home = "https://www.google.%(tld)s/"
@@ -89,7 +88,6 @@ USER_AGENT = 'Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.0)'
 # Load the list of valid user agents from the install folder.
 install_folder = os.path.abspath(os.path.split(__file__)[0])
 user_agents_file = os.path.join(install_folder, 'user_agents.txt')
-
 try:
     with open(user_agents_file) as fp:
         user_agents_list = [_.strip() for _ in fp.readlines()]
@@ -130,11 +128,42 @@ def get_page(url, user_agent=None):
     if user_agent is None:
         user_agent = USER_AGENT
 
-    request = requests.get(url, headers={'User-Agent', user_agent})
-    cookie = request.cookies.get_dict()
+    request = Request(url)
+    request.add_header('User-Agent', user_agent)
+    response = urlopen(request)
+    html = response.read()
+    response.close()
+    return html
 
-    html = request.content
-    request.close()
+
+# Request the given URL without cookie and return the response page, using the cookie jar.
+def get_page_without_cookie(url, user_agent=None):
+    """
+    Request the given URL without cookie and return the response page.
+
+    @type  url: str
+    @param url: URL to retrieve.
+
+    @type  user_agent: str
+    @param user_agent: User agent for the HTTP requests. Use C{None} for the
+        default.
+
+    @rtype:  str
+    @return: Web page retrieved for the given URL.
+
+    @raise IOError: An exception is raised on error.
+    @raise urllib2.URLError: An exception is raised on error.
+    @raise urllib2.HTTPError: An exception is raised on error.
+    """
+    if user_agent is None:
+        user_agent = USER_AGENT
+
+    request = Request(url)
+    request.add_header('User-Agent', user_agent)
+
+    response = urlopen(request)
+    html = response.read()
+    response.close()
     return html
 
 
@@ -218,14 +247,15 @@ def search_apps(query, tld='com', lang='en', tbs='0', safe='off', num=10,
 # URL as a string.
 def lucky(query, tld='com', lang='en', tbs='0', safe='off',
           only_standard=False, extra_params={}, tpe=''):
-    gen = search(query, tld, lang, tbs, safe, 1, 0, 1, 0., only_standard, extra_params, tpe)
+    gen = search(query, tld, lang, tbs, safe, 1, 0, 1, 0., only_standard,
+                 extra_params, tpe)
     return next(gen)
 
 
 # Returns a generator that yields URLs.
 def search(query, tld='com', lang='en', tbs='0', safe='off', num=10, start=0,
            stop=None, domains=None, pause=2.0, only_standard=False,
-           extra_params={}, tpe='', user_agent=None):
+           extra_params={}, tpe='', user_agent=None, use_cookie=True):
     """
     Search the given query string using Google.
 
@@ -288,6 +318,9 @@ def search(query, tld='com', lang='en', tbs='0', safe='off', num=10, start=0,
     @rtype:  generator
     @return: Generator (iterator) that yields found URLs. If the C{stop}
         parameter is C{None} the iterator will loop forever.
+
+    @:type use_cookie: bool
+    @param use_cookie: If C{True} search using cookie.
     """
     # Set of hashes for the results found.
     # This is used to avoid repeated results.
@@ -296,11 +329,26 @@ def search(query, tld='com', lang='en', tbs='0', safe='off', num=10, start=0,
     # Count the number of links yielded
     count = 0
 
-    # generate query to domain
-    generate_query(domains, query)
+    # Prepare domain list if it exists.
+    if domains:
+        domain_query = '+OR+'.join('site:' + domain for domain in domains)
+    else:
+        domain_query = ''
 
-    # check extra params
-    check_extra_params(extra_params)
+    # Prepare the search string.
+    query = quote_plus(query + '+' + domain_query)
+
+    # Check extra_params for overlapping
+    for builtin_param in ('hl', 'q', 'btnG', 'tbs', 'safe', 'tbm'):
+        if builtin_param in extra_params.keys():
+            raise ValueError(
+                'GET parameter "%s" is overlapping with \
+                the built-in GET parameter',
+                builtin_param
+            )
+
+    # Grab the cookie from the home page.
+    get_page(url_home % vars(), user_agent)
 
     # Prepare the URL of the first request.
     if start:
@@ -328,7 +376,17 @@ def search(query, tld='com', lang='en', tbs='0', safe='off', num=10, start=0,
         # Sleep between requests.
         time.sleep(pause)
 
-        soup = get_soup(url, user_agent)
+        # Request the Google Search results page.
+        if use_cookie is True:
+            html = get_page(url, user_agent)
+        else:
+            html = get_page_without_cookie(url, user_agent)
+
+        # Parse the response and process every anchored URL.
+        if is_bs4:
+            soup = BeautifulSoup(html, 'html.parser')
+        else:
+            soup = BeautifulSoup(html)
         anchors = soup.find(id='search').findAll('a')
         for a in anchors:
 
@@ -421,11 +479,28 @@ def hits(query, tld='com', lang='en', tbs='0', safe='off',
     @rtype:  int
     @return: Number of Google hits for the given search query.
     """
-    # generate query to domain
-    generate_query(domains, query)
 
-    # check extra params
-    check_extra_params(extra_params)
+    # Prepare domain list if it exists.
+    if domains:
+        domain_query = '+OR+'.join('site:' + domain for domain in domains)
+        domain_query = '+' + domain_query
+    else:
+        domain_query = ''
+
+    # Prepare the search string.
+    query = quote_plus(query + domain_query)
+
+    # Check extra_params for overlapping
+    for builtin_param in ('hl', 'q', 'btnG', 'tbs', 'safe', 'tbm'):
+        if builtin_param in extra_params.keys():
+            raise ValueError(
+                'GET parameter "%s" is overlapping with \
+                the built-in GET parameter',
+                builtin_param
+            )
+
+    # Grab the cookie from the home page.
+    get_page(url_home % vars())
 
     # Prepare the URL of the first (and in this cases ONLY) request.
     url = url_search % vars()
@@ -438,43 +513,18 @@ def hits(query, tld='com', lang='en', tbs='0', safe='off',
     for k, v in iter_extra_params:
         url += url + ('&%s=%s' % (k, v))
 
-    soup = get_soup(url, user_agent)
-
-    # Get the number of hits.
-    tag = soup.find_all(attrs={"class": "sd", "id": "resultStats"})[0]
-    return int(tag.text.split()[1].replace(',', ''))
-
-
-# Check extra_params for overlapping
-def check_extra_params(extra_params):
-    for builtin_param in ('hl', 'q', 'btnG', 'tbs', 'safe', 'tbm'):
-        if builtin_param in extra_params.keys():
-            raise ValueError('GET parameter "%s" is overlapping withthe built-in GET parameter', builtin_param)
-
-
-# Get html to generate soup
-def get_soup(url, user_agent):
     # Request the Google Search results page.
-    html = get_page(url, user_agent)
-    # Parse the response and process every anchored URL.
+    html = get_page(url)
+
+    # Parse the response.
     if is_bs4:
         soup = BeautifulSoup(html, 'html.parser')
     else:
         soup = BeautifulSoup(html)
-    return soup
 
-
-# Generate query to search
-def generate_query(domains, query):
-    # Prepare domain list if it exists.
-    if domains:
-        domain_query = '+OR+'.join('site:' + domain for domain in domains)
-        domain_query = '+' + domain_query
-    else:
-        domain_query = ''
-
-    # Prepare the search string.
-    query = quote_plus(query + domain_query)
+    # Get the number of hits.
+    tag = soup.find_all(attrs={"class": "sd", "id": "resultStats"})[0]
+    return int(tag.text.split()[1].replace(',', ''))
 
 
 def ngd(term1, term2):
